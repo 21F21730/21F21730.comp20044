@@ -1,0 +1,272 @@
+# ════════════════════════════════════════════════════════════════════════════════
+#  DRIVER PHONE USE DETECTION — COMPLETE ONE-CELL SOLUTION
+#  COMP 20037: Artificial Intelligence and Deep Learning — Spring 2026
+#  Downloads dataset → trains Custom CNN + MobileNetV2 → evaluates → plots
+#  Dataset: Hugging Face (public, no login). Classes: c0=safe, c1=phone
+#  ──> Just paste into ONE Google Colab cell and Run. (Set Runtime = T4 GPU)
+# ════════════════════════════════════════════════════════════════════════════════
+
+# ── 1. IMPORTS & SETUP ──────────────────────────────────────────────────────────
+import os, zipfile, shutil, random, glob, urllib.request, warnings
+warnings.filterwarnings("ignore")
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import tensorflow as tf
+from tensorflow.keras import layers, models, regularizers
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from sklearn.metrics import (classification_report, confusion_matrix, roc_auc_score,
+                             roc_curve, accuracy_score, f1_score,
+                             precision_score, recall_score)
+
+SEED = 42; IMG_SIZE = (128, 128); BATCH_SIZE = 32
+tf.random.set_seed(SEED); np.random.seed(SEED); random.seed(SEED)
+print("TensorFlow:", tf.__version__, "| GPU:", tf.config.list_physical_devices("GPU"))
+
+# ── 2. DOWNLOAD DATASET (public Hugging Face, no login) ──────────────────────────
+ZIP_URL = ("https://huggingface.co/datasets/gymprathap/Driver-Distracted-Dataset/"
+           "resolve/main/Distracted-Driver-Detection-Dataset.zip?download=true")
+RAW_DIR, BINARY_DIR = "ddd_raw", "data_binary"
+
+if not os.path.isdir(RAW_DIR):
+    print("\nDownloading dataset (~4.3 GB, a few minutes)...")
+    urllib.request.urlretrieve(ZIP_URL, "ddd.zip")
+    print("Extracting...")
+    with zipfile.ZipFile("ddd.zip", "r") as z:
+        z.extractall(RAW_DIR)
+    os.remove("ddd.zip")
+    print("Download + extract complete.")
+else:
+    print(f"\n'{RAW_DIR}' already exists — skipping download.")
+
+# ── 3. LOCATE c0 (safe) & c1 (phone) FOLDERS AUTOMATICALLY ───────────────────────
+def find_class_dir(root, cls):
+    hits = glob.glob(os.path.join(root, "**", cls), recursive=True)
+    hits = [h for h in hits if os.path.isdir(h) and
+            len([f for f in os.listdir(h) if f.lower().endswith(('.jpg','.jpeg','.png'))]) > 50]
+    return hits[0] if hits else None
+
+safe_dir  = find_class_dir(RAW_DIR, "c0")   # c0 = safe driving
+phone_dir = find_class_dir(RAW_DIR, "c1")   # c1 = texting / phone (right hand)
+print("\nsafe  (c0):", safe_dir)
+print("phone (c1):", phone_dir)
+assert safe_dir and phone_dir, "Could not find c0/c1 — run os.listdir(RAW_DIR) to inspect."
+
+# ── 4. BUILD TRAIN / VAL / TEST SPLIT (70 / 15 / 15) ─────────────────────────────
+LABEL_MAP = {"safe": safe_dir, "phone": phone_dir}
+if not os.path.isdir(BINARY_DIR):
+    for sp in ("train","val","test"):
+        for lbl in LABEL_MAP:
+            os.makedirs(os.path.join(BINARY_DIR, sp, lbl), exist_ok=True)
+    for label, src in LABEL_MAP.items():
+        files = sorted(f for f in os.listdir(src)
+                       if f.lower().endswith(('.jpg','.jpeg','.png')))
+        random.shuffle(files)
+        n = len(files); n_tr = int(n*0.70); n_val = int(n*0.15)
+        parts = {"train": files[:n_tr],
+                 "val":   files[n_tr:n_tr+n_val],
+                 "test":  files[n_tr+n_val:]}
+        for sp, flist in parts.items():
+            for fn in flist:
+                shutil.copy(os.path.join(src, fn),
+                            os.path.join(BINARY_DIR, sp, label, fn))
+        print(f"  {label:6s} | total={n} -> "
+              f"train={len(parts['train'])} val={len(parts['val'])} test={len(parts['test'])}")
+else:
+    print(f"'{BINARY_DIR}' already exists — skipping split.")
+
+# ── 5. DATA GENERATORS (augmentation on training set only) ───────────────────────
+train_datagen = ImageDataGenerator(
+    rescale=1./255, rotation_range=15, width_shift_range=0.10,
+    height_shift_range=0.10, shear_range=0.05, zoom_range=0.10,
+    horizontal_flip=True, brightness_range=[0.8, 1.2], fill_mode="nearest")
+plain_datagen = ImageDataGenerator(rescale=1./255)  # val/test: no augmentation
+
+train_gen = train_datagen.flow_from_directory(
+    os.path.join(BINARY_DIR,"train"), target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE, class_mode="binary", seed=SEED)
+val_gen = plain_datagen.flow_from_directory(
+    os.path.join(BINARY_DIR,"val"), target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE, class_mode="binary", seed=SEED)
+test_gen = plain_datagen.flow_from_directory(
+    os.path.join(BINARY_DIR,"test"), target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE, class_mode="binary", shuffle=False, seed=SEED)
+CLASS_NAMES = list(test_gen.class_indices.keys())
+print(f"\nClass indices: {train_gen.class_indices}")
+print(f"Train={train_gen.samples}  Val={val_gen.samples}  Test={test_gen.samples}")
+
+# ── 6. SHOW SAMPLE IMAGES ────────────────────────────────────────────────────────
+fig, axes = plt.subplots(2, 5, figsize=(16, 7))
+fig.suptitle("Sample Training Images\nTop: Safe Driving | Bottom: Phone Use",
+             fontsize=13, fontweight="bold")
+bimgs, blabels = next(iter(train_gen))
+s = p = 0
+for img, lbl in zip(bimgs, blabels):
+    lbl = int(lbl)
+    if s < 5 and lbl == train_gen.class_indices["safe"]:
+        axes[0,s].imshow(img); axes[0,s].set_title("Safe"); axes[0,s].axis("off"); s += 1
+    elif p < 5 and lbl == train_gen.class_indices["phone"]:
+        axes[1,p].imshow(img); axes[1,p].set_title("Phone Use"); axes[1,p].axis("off"); p += 1
+    if s == 5 and p == 5: break
+plt.tight_layout(); plt.savefig("sample_images.png", dpi=150, bbox_inches="tight"); plt.show()
+
+# ── 7. MODEL 1: CUSTOM CNN ───────────────────────────────────────────────────────
+def build_custom_cnn(shape=(128,128,3)):
+    m = models.Sequential(name="CustomCNN")
+    m.add(layers.Input(shape=shape))
+    # Block 1
+    m.add(layers.Conv2D(32,(3,3),padding="same",activation="relu"))
+    m.add(layers.BatchNormalization()); m.add(layers.MaxPooling2D((2,2)))
+    # Block 2
+    m.add(layers.Conv2D(64,(3,3),padding="same",activation="relu"))
+    m.add(layers.BatchNormalization()); m.add(layers.MaxPooling2D((2,2))); m.add(layers.Dropout(0.25))
+    # Block 3
+    m.add(layers.Conv2D(128,(3,3),padding="same",activation="relu"))
+    m.add(layers.BatchNormalization()); m.add(layers.MaxPooling2D((2,2))); m.add(layers.Dropout(0.25))
+    # Head
+    m.add(layers.Flatten())
+    m.add(layers.Dense(256,activation="relu",kernel_regularizer=regularizers.l2(1e-4)))
+    m.add(layers.BatchNormalization()); m.add(layers.Dropout(0.50))
+    m.add(layers.Dense(1,activation="sigmoid"))
+    return m
+
+cnn_model = build_custom_cnn()
+cnn_model.summary()
+cnn_model.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
+                  loss="binary_crossentropy", metrics=["accuracy"])
+cnn_cb = [EarlyStopping(monitor="val_loss",patience=6,restore_best_weights=True,verbose=1),
+          ReduceLROnPlateau(monitor="val_loss",factor=0.5,patience=3,min_lr=1e-6,verbose=1)]
+print("\n>>> Training Custom CNN ...")
+cnn_history = cnn_model.fit(train_gen, epochs=30, validation_data=val_gen,
+                            callbacks=cnn_cb, verbose=1)
+
+# ── 8. MODEL 2: TRANSFER LEARNING (MobileNetV2) ──────────────────────────────────
+base_model = MobileNetV2(input_shape=(128,128,3), include_top=False, weights="imagenet")
+base_model.trainable = False
+inp = layers.Input(shape=(128,128,3))
+x = base_model(inp, training=False)
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.Dense(128, activation="relu")(x)
+x = layers.Dropout(0.40)(x)
+out = layers.Dense(1, activation="sigmoid")(x)
+tl_model = models.Model(inp, out, name="MobileNetV2_TL")
+tl_model.summary()
+
+# Phase 1: frozen base
+tl_model.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
+                 loss="binary_crossentropy", metrics=["accuracy"])
+cb1 = [EarlyStopping(monitor="val_loss",patience=5,restore_best_weights=True,verbose=1),
+       ReduceLROnPlateau(monitor="val_loss",factor=0.5,patience=3,min_lr=1e-7,verbose=1)]
+print("\n>>> TL Phase 1 — training head (base frozen) ...")
+h1 = tl_model.fit(train_gen, epochs=15, validation_data=val_gen, callbacks=cb1, verbose=1)
+
+# Phase 2: fine-tune last 20 layers
+print("\n>>> TL Phase 2 — fine-tuning last 20 layers ...")
+base_model.trainable = True
+for layer in base_model.layers[:-20]:
+    layer.trainable = False
+tl_model.compile(optimizer=tf.keras.optimizers.Adam(1e-5),
+                 loss="binary_crossentropy", metrics=["accuracy"])
+cb2 = [EarlyStopping(monitor="val_loss",patience=5,restore_best_weights=True,verbose=1),
+       ReduceLROnPlateau(monitor="val_loss",factor=0.5,patience=3,min_lr=1e-8,verbose=1)]
+h2 = tl_model.fit(train_gen, epochs=10, validation_data=val_gen, callbacks=cb2, verbose=1)
+
+class _MH:
+    def __init__(self, a, b):
+        self.history = {k: a.history[k] + b.history.get(k, []) for k in a.history}
+tl_history = _MH(h1, h2)
+
+# ── 9. TRAINING CURVES ───────────────────────────────────────────────────────────
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+fig.suptitle("Training History: Custom CNN vs MobileNetV2 Transfer Learning",
+             fontsize=14, fontweight="bold")
+for i,(h,name) in enumerate([(cnn_history,"Custom CNN"),(tl_history,"MobileNetV2 TL")]):
+    ep = range(1, len(h.history["accuracy"])+1)
+    axes[i,0].plot(ep,h.history["accuracy"],label="Train",color="steelblue",lw=2)
+    axes[i,0].plot(ep,h.history["val_accuracy"],label="Validation",color="tomato",lw=2)
+    axes[i,0].set_title(f"{name} — Accuracy"); axes[i,0].set_xlabel("Epoch")
+    axes[i,0].set_ylabel("Accuracy"); axes[i,0].set_ylim(0.4,1.05)
+    axes[i,0].legend(); axes[i,0].grid(alpha=0.3)
+    axes[i,1].plot(ep,h.history["loss"],label="Train",color="steelblue",lw=2)
+    axes[i,1].plot(ep,h.history["val_loss"],label="Validation",color="tomato",lw=2)
+    axes[i,1].set_title(f"{name} — Loss"); axes[i,1].set_xlabel("Epoch")
+    axes[i,1].set_ylabel("Loss"); axes[i,1].legend(); axes[i,1].grid(alpha=0.3)
+plt.tight_layout(); plt.savefig("training_curves.png", dpi=150, bbox_inches="tight"); plt.show()
+
+# ── 10. EVALUATE ON TEST SET ─────────────────────────────────────────────────────
+test_gen.reset(); cnn_prob = cnn_model.predict(test_gen, verbose=1).flatten()
+cnn_pred = (cnn_prob >= 0.5).astype(int)
+test_gen.reset(); tl_prob = tl_model.predict(test_gen, verbose=1).flatten()
+tl_pred = (tl_prob >= 0.5).astype(int)
+y_true = test_gen.classes
+
+def mets(yt, yp, yprob):
+    return dict(accuracy=accuracy_score(yt,yp),
+                precision=precision_score(yt,yp,average="weighted",zero_division=0),
+                recall=recall_score(yt,yp,average="weighted",zero_division=0),
+                f1=f1_score(yt,yp,average="weighted",zero_division=0),
+                auc=roc_auc_score(yt,yprob))
+cnn_m, tl_m = mets(y_true,cnn_pred,cnn_prob), mets(y_true,tl_pred,tl_prob)
+
+print("\n" + "="*70)
+print(f"{'Model':<20}{'Accuracy':>10}{'Precision':>11}{'Recall':>9}{'F1':>9}{'AUC':>9}")
+print("-"*70)
+print(f"{'Custom CNN':<20}{cnn_m['accuracy']:>10.4f}{cnn_m['precision']:>11.4f}{cnn_m['recall']:>9.4f}{cnn_m['f1']:>9.4f}{cnn_m['auc']:>9.4f}")
+print(f"{'MobileNetV2 TL':<20}{tl_m['accuracy']:>10.4f}{tl_m['precision']:>11.4f}{tl_m['recall']:>9.4f}{tl_m['f1']:>9.4f}{tl_m['auc']:>9.4f}")
+print("="*70)
+print("\n── Custom CNN Classification Report ──")
+print(classification_report(y_true, cnn_pred, target_names=CLASS_NAMES, digits=4))
+print("\n── MobileNetV2 Transfer Learning Report ──")
+print(classification_report(y_true, tl_pred, target_names=CLASS_NAMES, digits=4))
+
+# ── 11. CONFUSION MATRICES + ROC CURVES ──────────────────────────────────────────
+fig, axes = plt.subplots(2, 2, figsize=(14, 11))
+fig.suptitle("Model Evaluation: Confusion Matrices & ROC Curves",
+             fontsize=14, fontweight="bold")
+for i,(pred,prob,name,m) in enumerate([(cnn_pred,cnn_prob,"Custom CNN",cnn_m),
+                                       (tl_pred,tl_prob,"MobileNetV2 TL",tl_m)]):
+    cm = confusion_matrix(y_true, pred)
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=axes[i,0],
+                xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES,
+                linewidths=0.5, annot_kws={"size":14})
+    axes[i,0].set_title(f"{name}\nConfusion Matrix (Acc={m['accuracy']:.4f})")
+    axes[i,0].set_xlabel("Predicted"); axes[i,0].set_ylabel("True")
+    fpr,tpr,_ = roc_curve(y_true, prob)
+    axes[i,1].plot(fpr,tpr,color="darkorange",lw=2,label=f"AUC={m['auc']:.4f}")
+    axes[i,1].plot([0,1],[0,1],"k--",lw=1,label="Random")
+    axes[i,1].fill_between(fpr,tpr,alpha=0.1,color="darkorange")
+    axes[i,1].set_title(f"{name}\nROC Curve"); axes[i,1].set_xlabel("FPR")
+    axes[i,1].set_ylabel("TPR"); axes[i,1].legend(loc="lower right"); axes[i,1].grid(alpha=0.3)
+plt.tight_layout(); plt.savefig("evaluation_results.png", dpi=150, bbox_inches="tight"); plt.show()
+
+# ── 12. METRIC COMPARISON BAR CHART ──────────────────────────────────────────────
+x, w = np.arange(3), 0.32
+fig, ax = plt.subplots(figsize=(9, 5))
+b1 = ax.bar(x-w/2, [cnn_m["accuracy"],cnn_m["f1"],cnn_m["auc"]], w,
+            label="Custom CNN", color="steelblue", edgecolor="black")
+b2 = ax.bar(x+w/2, [tl_m["accuracy"],tl_m["f1"],tl_m["auc"]], w,
+            label="MobileNetV2 TL", color="tomato", edgecolor="black")
+for b in list(b1)+list(b2):
+    ax.text(b.get_x()+b.get_width()/2., b.get_height()+0.005,
+            f"{b.get_height():.3f}", ha="center", fontsize=10, fontweight="bold")
+ax.set_xticks(x); ax.set_xticklabels(["Accuracy","F1-Score","AUC-ROC"], fontsize=12)
+ax.set_ylim(0,1.15); ax.legend(fontsize=11); ax.grid(axis="y",alpha=0.3)
+ax.set_title("Performance Comparison: Custom CNN vs MobileNetV2 TL",
+             fontsize=13, fontweight="bold")
+plt.tight_layout(); plt.savefig("metric_comparison.png", dpi=150, bbox_inches="tight"); plt.show()
+
+# ── 13. SAVE MODELS + FINAL SUMMARY ──────────────────────────────────────────────
+cnn_model.save("custom_cnn_model.keras")
+tl_model.save("mobilenet_tl_model.keras")
+print("\n" + "="*60)
+print("FINAL SUMMARY")
+print("="*60)
+print(f"  Train/Val/Test : {train_gen.samples}/{val_gen.samples}/{test_gen.samples}")
+print(f"  Custom CNN     : Acc={cnn_m['accuracy']:.4f}  F1={cnn_m['f1']:.4f}  AUC={cnn_m['auc']:.4f}")
+print(f"  MobileNetV2 TL : Acc={tl_m['accuracy']:.4f}  F1={tl_m['f1']:.4f}  AUC={tl_m['auc']:.4f}")
+print(f"  Best Model     : {'MobileNetV2 TL' if tl_m['accuracy']>=cnn_m['accuracy'] else 'Custom CNN'}")
+print("="*60)
+print("\nFigures saved: sample_images.png, training_curves.png,")
+print("evaluation_results.png, metric_comparison.png")
